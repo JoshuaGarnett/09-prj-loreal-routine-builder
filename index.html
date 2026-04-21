@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -21,14 +21,18 @@
       <header class="site-header">
         <img src="img/loreal-logo.png" alt="L'Oréal Logo" class="logo" />
         <h1 class="site-title">Smart Routine &amp; Product Advisor</h1>
+        <p id="appStatus" class="app-status is-booting" aria-live="polite">
+          App status: waiting for script...
+        </p>
       </header>
 
-      <!-- Category Filter -->
+      <!-- Product Controls -->
       <div class="search-section">
-        <select id="categoryFilter">
-          <option value="" disabled selected>Choose a Category</option>
+        <select id="categoryFilter" aria-label="Filter by category">
+          <option value="all" selected>All Categories</option>
           <option value="cleanser">Cleansers</option>
           <option value="moisturizer">Moisturizers & Treatments</option>
+          <option value="skincare">Skincare Serums & SPF</option>
           <option value="haircare">Haircare</option>
           <option value="makeup">Makeup</option>
           <option value="hair color">Hair Color</option>
@@ -37,24 +41,36 @@
           <option value="suncare">Suncare</option>
           <option value="fragrance">Fragrance</option>
         </select>
+
+        <label for="productSearch" class="visually-hidden"
+          >Search products</label
+        >
+        <input
+          id="productSearch"
+          type="search"
+          placeholder="Search by product name, brand, or keyword"
+          autocomplete="off"
+        />
+
+        <label class="rtl-toggle" for="rtlToggle">
+          <input id="rtlToggle" type="checkbox" />
+          RTL Mode
+        </label>
       </div>
 
       <!-- Products Grid -->
       <div id="productsContainer" class="products-grid"></div>
 
-      <!-- Selected Products -->
-      <div class="selected-products">
-        <h2>Selected Products</h2>
-        <div id="selectedProductsList"></div>
-        <button id="generateRoutine" class="generate-btn">
-          <i class="fa-solid fa-wand-magic-sparkles"></i> Generate Routine
-        </button>
-      </div>
-
       <!------- Chat Area ------->
       <section class="chatbox">
         <h2>Let's Build Your Routine</h2>
         <div id="chatWindow" class="chat-window"></div>
+
+        <div id="preRoutineActions" class="pre-routine-actions">
+          <button id="generateRoutine" class="generate-btn" type="button">
+            <i class="fa-solid fa-wand-magic-sparkles"></i> Generate Routine
+          </button>
+        </div>
 
         <form id="chatForm" class="chat-form">
           <label for="userInput" class="visually-hidden">Message</label>
@@ -71,6 +87,22 @@
             <span class="visually-hidden">Send</span>
           </button>
         </form>
+
+        <div class="routine-topbar">
+          <p id="selectionSummary" class="selection-summary">
+            No products selected yet.
+          </p>
+          <div id="selectedProductsList" class="selected-list"></div>
+          <div class="routine-actions">
+            <button id="clearSelections" class="clear-btn" type="button">
+              Clear Selections
+            </button>
+          </div>
+        </div>
+
+        <button id="clearChat" class="clear-chat-btn" type="button">
+          Clear Chat
+        </button>
       </section>
 
       <!------- Footer Links ------->
@@ -85,8 +117,777 @@
       </footer>
     </div>
 
-    <!-- secrets.js can be removed when using Cloudflare Workers for API requests -->
-    <script src="secrets.js"></script>
-    <script src="script.js"></script>
+    <script src="products-data.js"></script>
+    <script>
+      (function () {
+        var APP_VERSION = "fallback-primary-1";
+        var WORKER_URL = "https://holy-king-6ca1.josh-j-garnett.workers.dev/";
+        var STORAGE_SELECTED = "loreal-selected-products";
+        var STORAGE_RTL = "loreal-rtl-mode";
+
+        var statusEl = document.getElementById("appStatus");
+        var categoryFilter = document.getElementById("categoryFilter");
+        var productSearch = document.getElementById("productSearch");
+        var rtlToggle = document.getElementById("rtlToggle");
+        var productsContainer = document.getElementById("productsContainer");
+        var selectedList = document.getElementById("selectedProductsList");
+        var selectionSummary = document.getElementById("selectionSummary");
+        var clearSelectionsBtn = document.getElementById("clearSelections");
+        var generateBtn = document.getElementById("generateRoutine");
+        var preRoutineActions = document.getElementById("preRoutineActions");
+        var chatWindow = document.getElementById("chatWindow");
+        var chatForm = document.getElementById("chatForm");
+        var userInput = document.getElementById("userInput");
+        var clearChatBtn = document.getElementById("clearChat");
+
+        var allProducts =
+          window.PRODUCTS_DATA && Array.isArray(window.PRODUCTS_DATA.products)
+            ? window.PRODUCTS_DATA.products
+            : [];
+        var selectedIds = new Set();
+        var expandedIds = new Set();
+        var conversationHistory = [];
+        var hasGeneratedRoutine = false;
+
+        function setStatus(state, text) {
+          if (!statusEl) {
+            return;
+          }
+
+          statusEl.classList.remove("is-booting", "is-ready", "is-error");
+          statusEl.classList.add(state);
+          statusEl.textContent = text;
+        }
+
+        function escapeHtml(text) {
+          return String(text)
+            .split("&")
+            .join("&amp;")
+            .split("<")
+            .join("&lt;")
+            .split(">")
+            .join("&gt;")
+            .split('"')
+            .join("&quot;")
+            .split("'")
+            .join("&#39;");
+        }
+
+        function normalizeLink(urlText) {
+          var decoded = String(urlText).split("&amp;").join("&");
+
+          try {
+            var parsed = new URL(decoded);
+            if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+              return decoded;
+            }
+            return null;
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function formatInline(text) {
+          var safe = escapeHtml(text);
+          var links = [];
+
+          function saveLink(label, href) {
+            var normalized = normalizeLink(href);
+            if (!normalized) {
+              return label;
+            }
+            var anchor =
+              '<a href="' +
+              normalized +
+              '" target="_blank" rel="noopener noreferrer">' +
+              label +
+              "</a>";
+            var key = "@@LINK_" + links.length + "@@";
+            links.push(anchor);
+            return key;
+          }
+
+          safe = safe.replace(
+            /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+            function (_, label, href) {
+              return saveLink(label, href);
+            },
+          );
+          safe = safe.replace(/(https?:\/\/[^\s<]+)/g, function (_, href) {
+            return saveLink(href, href);
+          });
+          safe = safe.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+          safe = safe.replace(
+            /(^|\s)\*(?!\*)([^\n*]+?)\*(?!\*)/g,
+            "$1<em>$2</em>",
+          );
+          safe = safe.replace(/@@LINK_(\d+)@@/g, function (_, idx) {
+            return links[Number(idx)] || "";
+          });
+
+          return safe;
+        }
+
+        function formatMessage(message) {
+          var lines = String(message).replace(/\r\n/g, "\n").split("\n");
+          var html = [];
+          var listStack = [];
+          var sawBlankAfterList = false;
+
+          function closeListLevel() {
+            if (!listStack.length) {
+              return;
+            }
+            var current = listStack[listStack.length - 1];
+            if (current.liOpen) {
+              html.push("</li>");
+            }
+            html.push("</" + current.type + ">");
+            listStack.pop();
+          }
+
+          function flushAllLists() {
+            while (listStack.length) {
+              closeListLevel();
+            }
+            sawBlankAfterList = false;
+          }
+
+          function ensureListAtDepth(depth, type) {
+            if (depth < 0) {
+              depth = 0;
+            }
+            if (depth > listStack.length) {
+              depth = listStack.length;
+            }
+
+            while (listStack.length > depth + 1) {
+              closeListLevel();
+            }
+
+            if (listStack.length === depth + 1) {
+              var existing = listStack[depth];
+              if (existing.type !== type) {
+                if (existing.liOpen) {
+                  html.push("</li>");
+                  existing.liOpen = false;
+                }
+                html.push("</" + existing.type + ">");
+                listStack.pop();
+              }
+            }
+
+            while (listStack.length < depth + 1) {
+              html.push("<" + type + ">");
+              listStack.push({ type: type, liOpen: false });
+            }
+
+            var level = listStack[depth];
+            if (level.liOpen) {
+              html.push("</li>");
+            }
+            return level;
+          }
+
+          lines.forEach(function (line) {
+            var raw = line.trim();
+            var listMatch = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+            var isListLine = Boolean(listMatch);
+            var indentText = line.match(/^(\s*)/)[1].replace(/\t/g, "  ");
+            var isIndentedText =
+              Boolean(raw) && !isListLine && indentText.length > 0;
+            var hasOpenListItem =
+              listStack.length && listStack[listStack.length - 1].liOpen;
+            var isContinuationParagraph = isIndentedText && hasOpenListItem;
+
+            if (!raw) {
+              if (listStack.length) {
+                sawBlankAfterList = true;
+              }
+              return;
+            }
+
+            if (sawBlankAfterList) {
+              if (!isListLine && !isContinuationParagraph) {
+                flushAllLists();
+              }
+              sawBlankAfterList = false;
+            }
+
+            var heading = raw.match(/^(#{1,6})\s+(.*)$/);
+            if (heading) {
+              flushAllLists();
+              var level = Math.min(heading[1].length, 6);
+              html.push(
+                "<h" +
+                  level +
+                  ">" +
+                  formatInline(heading[2]) +
+                  "</h" +
+                  level +
+                  ">",
+              );
+              return;
+            }
+
+            if (listMatch) {
+              var listIndentText = listMatch[1].replace(/\t/g, "  ");
+              var depth = Math.floor(listIndentText.length / 2);
+              var marker = listMatch[2];
+              var listType = /\d/.test(marker) ? "ol" : "ul";
+              var itemText = listMatch[3];
+              var targetLevel = ensureListAtDepth(depth, listType);
+              html.push("<li>" + formatInline(itemText));
+              targetLevel.liOpen = true;
+              return;
+            }
+
+            if (isContinuationParagraph) {
+              html.push("<p>" + formatInline(raw) + "</p>");
+              return;
+            }
+
+            flushAllLists();
+            html.push("<p>" + formatInline(raw) + "</p>");
+          });
+
+          flushAllLists();
+          return html.join("");
+        }
+
+        function addMessage(role, text) {
+          if (!chatWindow) {
+            return;
+          }
+
+          var el = document.createElement("div");
+          el.className =
+            "chat-message " + (role === "user" ? "user" : "assistant");
+          if (role === "assistant") {
+            el.innerHTML = formatMessage(text);
+          } else {
+            el.textContent = text;
+          }
+          chatWindow.appendChild(el);
+          chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        function addLoadingBubble(label) {
+          var bubble = document.createElement("div");
+          bubble.className = "chat-message assistant loading-bubble";
+          bubble.innerHTML =
+            escapeHtml(label || "Thinking") +
+            ' <span class="loading-dot"></span><span class="loading-dot"></span><span class="loading-dot"></span>';
+          chatWindow.appendChild(bubble);
+          chatWindow.scrollTop = chatWindow.scrollHeight;
+          return bubble;
+        }
+
+        function updateChatInputState() {
+          if (hasGeneratedRoutine) {
+            if (preRoutineActions) {
+              preRoutineActions.classList.add("is-hidden");
+            }
+            if (chatForm) {
+              chatForm.classList.remove("is-hidden");
+            }
+            return;
+          }
+
+          if (preRoutineActions) {
+            preRoutineActions.classList.remove("is-hidden");
+          }
+          if (chatForm) {
+            chatForm.classList.add("is-hidden");
+          }
+        }
+
+        function removeLoadingBubble(bubble) {
+          if (bubble && bubble.parentElement) {
+            bubble.remove();
+          }
+        }
+
+        function saveSelections() {
+          localStorage.setItem(
+            STORAGE_SELECTED,
+            JSON.stringify(Array.from(selectedIds)),
+          );
+        }
+
+        function loadSelections() {
+          var raw = localStorage.getItem(STORAGE_SELECTED);
+          if (!raw) {
+            return;
+          }
+          try {
+            var parsed = JSON.parse(raw);
+            selectedIds = new Set(parsed);
+          } catch (error) {
+            selectedIds = new Set();
+          }
+        }
+
+        function applyDirection(isRtl) {
+          document.documentElement.setAttribute("dir", isRtl ? "rtl" : "ltr");
+          if (rtlToggle) {
+            rtlToggle.checked = isRtl;
+          }
+        }
+
+        function loadDirection() {
+          var saved = localStorage.getItem(STORAGE_RTL);
+          applyDirection(saved === "true");
+        }
+
+        function getSelectedProducts() {
+          return allProducts.filter(function (product) {
+            return selectedIds.has(product.id);
+          });
+        }
+
+        function toggleSelection(id) {
+          if (selectedIds.has(id)) {
+            selectedIds.delete(id);
+          } else {
+            selectedIds.add(id);
+          }
+          saveSelections();
+          renderProducts();
+          renderSelected();
+        }
+
+        function toggleDescription(id) {
+          if (expandedIds.has(id)) {
+            expandedIds.delete(id);
+          } else {
+            expandedIds.add(id);
+          }
+          renderProducts();
+        }
+
+        function renderProducts() {
+          var selectedCategory = categoryFilter ? categoryFilter.value : "all";
+          var term = productSearch
+            ? productSearch.value.trim().toLowerCase()
+            : "";
+
+          var filtered = allProducts.filter(function (product) {
+            var categoryMatch =
+              selectedCategory === "all" ||
+              product.category === selectedCategory;
+            var searchMatch =
+              !term ||
+              product.name.toLowerCase().indexOf(term) >= 0 ||
+              product.brand.toLowerCase().indexOf(term) >= 0 ||
+              product.description.toLowerCase().indexOf(term) >= 0;
+            return categoryMatch && searchMatch;
+          });
+
+          if (!filtered.length) {
+            productsContainer.innerHTML =
+              '<div class="placeholder-message">No products match your search. Try a different keyword or category.</div>';
+            return;
+          }
+
+          productsContainer.innerHTML = filtered
+            .map(function (product) {
+              var selected = selectedIds.has(product.id);
+              var open = expandedIds.has(product.id);
+              return (
+                '\n<article class="product-card ' +
+                (selected ? "selected" : "") +
+                '" data-id="' +
+                product.id +
+                '" aria-pressed="' +
+                (selected ? "true" : "false") +
+                '">\n  <div class="product-top">\n    <img src="' +
+                product.image +
+                '" alt="' +
+                product.name +
+                '" loading="lazy" />\n    <div class="product-info">\n      <h3>' +
+                product.name +
+                '</h3>\n      <p class="brand">' +
+                product.brand +
+                '</p>\n      <span class="badge">' +
+                product.category +
+                '</span>\n    </div>\n  </div>\n  <div class="card-actions">\n    <button type="button" class="toggle-selection">' +
+                (selected ? "Unselect" : "Select") +
+                '</button>\n    <button type="button" class="toggle-description" aria-expanded="' +
+                (open ? "true" : "false") +
+                '">' +
+                (open ? "Hide Details" : "View Details") +
+                '</button>\n  </div>\n  <p class="description-panel ' +
+                (open ? "open" : "") +
+                '">' +
+                product.description +
+                "</p>\n</article>"
+              );
+            })
+            .join("");
+        }
+
+        function renderSelected() {
+          var selectedProducts = getSelectedProducts();
+
+          if (!selectedProducts.length) {
+            selectionSummary.textContent = "No products selected yet.";
+            selectedList.innerHTML = "";
+            return;
+          }
+
+          selectionSummary.textContent =
+            selectedProducts.length +
+            (selectedProducts.length === 1
+              ? " product selected."
+              : " products selected.");
+
+          selectedList.innerHTML = selectedProducts
+            .map(function (product) {
+              return (
+                '<div class="selected-pill"><span>' +
+                product.name +
+                '</span><button type="button" class="remove-pill" data-remove-id="' +
+                product.id +
+                '">x</button></div>'
+              );
+            })
+            .join("");
+        }
+
+        function parseWorkerResponse(data) {
+          var choice =
+            data && data.choices && data.choices[0] ? data.choices[0] : null;
+
+          if (data && data.reply) {
+            return {
+              content: data.reply,
+              finishReason: choice ? choice.finish_reason || null : null,
+            };
+          }
+
+          if (data && data.response) {
+            return {
+              content: data.response,
+              finishReason: choice ? choice.finish_reason || null : null,
+            };
+          }
+
+          if (data && data.output_text) {
+            return {
+              content: data.output_text,
+              finishReason: choice ? choice.finish_reason || null : null,
+            };
+          }
+
+          if (choice && choice.message && choice.message.content) {
+            return {
+              content: choice.message.content,
+              finishReason: choice.finish_reason || null,
+            };
+          }
+
+          return {
+            content: "I received a response but could not parse it.",
+            finishReason: null,
+          };
+        }
+
+        async function requestWorker(messages, selectedProducts, mode) {
+          var controller = new AbortController();
+          var timeoutId = setTimeout(function () {
+            controller.abort();
+          }, 35000);
+
+          try {
+            var response = await fetch(WORKER_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                mode: mode,
+                model: "gpt-4o-search-preview",
+                fallbackModel: "gpt-4o",
+                webSearch: true,
+                max_output_tokens: 1800,
+                messages: messages,
+                selectedProducts: selectedProducts,
+              }),
+              signal: controller.signal,
+            });
+
+            var raw = await response.text();
+
+            if (!response.ok) {
+              throw new Error("Worker error " + response.status + ": " + raw);
+            }
+
+            if (!raw.trim()) {
+              throw new Error("Worker returned an empty response.");
+            }
+
+            try {
+              return parseWorkerResponse(JSON.parse(raw));
+            } catch (error) {
+              return { content: raw, finishReason: null };
+            }
+          } catch (error) {
+            if (error.name === "AbortError") {
+              throw new Error(
+                "The request took too long and timed out. Please try again.",
+              );
+            }
+            throw error;
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        }
+
+        async function sendWithContinuation(messages, selectedProducts, mode) {
+          var maxRounds = 2;
+          var history = messages.slice();
+          var combined = "";
+
+          for (var i = 0; i <= maxRounds; i += 1) {
+            var result = await requestWorker(history, selectedProducts, mode);
+            var chunk = (result.content || "").trim();
+
+            if (chunk) {
+              combined += combined ? "\n\n" + chunk : chunk;
+              history.push({ role: "assistant", content: chunk });
+            }
+
+            if (result.finishReason !== "length") {
+              return combined || chunk;
+            }
+
+            history.push({
+              role: "user",
+              content:
+                "Continue exactly where you left off. Do not repeat previous text.",
+            });
+          }
+
+          return combined;
+        }
+
+        function buildSystemMessage() {
+          return {
+            role: "system",
+            content:
+              "You are a helpful and enthusiastic L'Oreal routine advisor. Follow-ups & answers should stay on routine, skincare, haircare, makeup, fragrance, suncare, or grooming topics.",
+          };
+        }
+
+        async function generateRoutine() {
+          var selectedProducts = getSelectedProducts().map(function (product) {
+            return {
+              name: product.name,
+              brand: product.brand,
+              category: product.category,
+              description: product.description,
+            };
+          });
+
+          if (!selectedProducts.length) {
+            addMessage(
+              "assistant",
+              "Please select at least one product first.",
+            );
+            return;
+          }
+
+          var prompt =
+            "Create a personalized routine using ONLY these selected products and name each product in the routine: " +
+            JSON.stringify(selectedProducts, null, 2);
+
+          conversationHistory = [
+            buildSystemMessage(),
+            { role: "user", content: prompt },
+          ];
+          addMessage("user", "Generate my routine using my selected products.");
+          var loading = addLoadingBubble("Generating routine");
+
+          try {
+            var assistant = await sendWithContinuation(
+              conversationHistory,
+              selectedProducts,
+              "routine",
+            );
+            removeLoadingBubble(loading);
+            conversationHistory.push({ role: "assistant", content: assistant });
+            hasGeneratedRoutine = true;
+            updateChatInputState();
+            addMessage("assistant", assistant);
+          } catch (error) {
+            removeLoadingBubble(loading);
+            addMessage(
+              "assistant",
+              "I could not generate your routine right now. " + error.message,
+            );
+          }
+        }
+
+        async function sendFollowUp() {
+          var message = userInput.value.trim();
+          if (!message) {
+            return;
+          }
+
+          if (!hasGeneratedRoutine) {
+            addMessage(
+              "assistant",
+              "Generate a routine first, then ask follow-up questions.",
+            );
+            return;
+          }
+
+          addMessage("user", message);
+          userInput.value = "";
+          conversationHistory.push({ role: "user", content: message });
+
+          var selectedProducts = getSelectedProducts().map(function (product) {
+            return {
+              name: product.name,
+              brand: product.brand,
+              category: product.category,
+              description: product.description,
+            };
+          });
+
+          var loading = addLoadingBubble("Thinking");
+
+          try {
+            var assistant = await sendWithContinuation(
+              conversationHistory,
+              selectedProducts,
+              "follow-up",
+            );
+            removeLoadingBubble(loading);
+            conversationHistory.push({ role: "assistant", content: assistant });
+            addMessage("assistant", assistant);
+          } catch (error) {
+            removeLoadingBubble(loading);
+            addMessage(
+              "assistant",
+              "I could not answer that follow-up right now. " + error.message,
+            );
+          }
+        }
+
+        function bindEvents() {
+          if (categoryFilter) {
+            categoryFilter.addEventListener("change", renderProducts);
+          }
+
+          if (productSearch) {
+            productSearch.addEventListener("input", renderProducts);
+          }
+
+          if (rtlToggle) {
+            rtlToggle.addEventListener("change", function () {
+              applyDirection(rtlToggle.checked);
+              localStorage.setItem(STORAGE_RTL, String(rtlToggle.checked));
+            });
+          }
+
+          productsContainer.addEventListener("click", function (event) {
+            var card = event.target.closest(".product-card");
+            if (!card) {
+              return;
+            }
+
+            var id = Number(card.dataset.id);
+            var selectBtn = event.target.closest(".toggle-selection");
+            var detailBtn = event.target.closest(".toggle-description");
+
+            if (selectBtn) {
+              toggleSelection(id);
+              return;
+            }
+
+            if (detailBtn) {
+              toggleDescription(id);
+              return;
+            }
+
+            if (!event.target.closest("button")) {
+              toggleSelection(id);
+            }
+          });
+
+          selectedList.addEventListener("click", function (event) {
+            var removeBtn = event.target.closest("[data-remove-id]");
+            if (!removeBtn) {
+              return;
+            }
+            selectedIds.delete(Number(removeBtn.dataset.removeId));
+            saveSelections();
+            renderProducts();
+            renderSelected();
+          });
+
+          clearSelectionsBtn.addEventListener("click", function () {
+            selectedIds.clear();
+            saveSelections();
+            renderProducts();
+            renderSelected();
+            addMessage(
+              "assistant",
+              "Your selected products list has been cleared.",
+            );
+          });
+
+          generateBtn.addEventListener("click", generateRoutine);
+
+          chatForm.addEventListener("submit", function (event) {
+            event.preventDefault();
+            sendFollowUp();
+          });
+
+          clearChatBtn.addEventListener("click", function () {
+            chatWindow.innerHTML = "";
+            conversationHistory = [];
+            hasGeneratedRoutine = false;
+            updateChatInputState();
+            addMessage(
+              "assistant",
+              "Chat cleared. Generate a routine again when you are ready.",
+            );
+          });
+        }
+
+        try {
+          setStatus("is-booting", "App status: booting fallback runtime...");
+          loadSelections();
+          loadDirection();
+          bindEvents();
+          renderProducts();
+          renderSelected();
+          updateChatInputState();
+          addMessage(
+            "assistant",
+            "Select products, then click Generate Routine.",
+          );
+
+          window.__APP_READY = true;
+          window.__APP_SCRIPT_LOADED = true;
+          window.__APP_INIT_FAILED = false;
+          setStatus(
+            "is-ready",
+            "App status: ready (fallback primary, v" + APP_VERSION + ")",
+          );
+        } catch (error) {
+          window.__APP_READY = false;
+          window.__APP_SCRIPT_LOADED = true;
+          window.__APP_INIT_FAILED = true;
+          setStatus("is-error", "App status: error in fallback runtime");
+          if (productsContainer) {
+            productsContainer.innerHTML =
+              '<div class="placeholder-message">Fallback runtime failed to start.</div>';
+          }
+          console.error(error);
+        }
+      })();
+    </script>
   </body>
 </html>
